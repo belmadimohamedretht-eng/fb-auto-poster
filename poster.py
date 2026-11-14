@@ -3,6 +3,7 @@ import json
 import io
 from datetime import datetime, timezone
 import requests
+from PIL import Image
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -63,14 +64,28 @@ def download_file(file_id):
     fh.seek(0)
     return fh
 
+def prepare_image_for_fb(image_stream, filename):
+    """تحويل صور WebP إلى JPG في الذاكرة لضمان قبولها 100% في فيسبوك"""
+    if filename.lower().endswith(".webp"):
+        img = Image.open(image_stream).convert("RGB")
+        output_stream = io.BytesIO()
+        img.save(output_stream, format="JPEG", quality=95)
+        output_stream.seek(0)
+        new_filename = os.path.splitext(filename)[0] + ".jpg"
+        return output_stream, new_filename, "image/jpeg"
+    
+    mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+    return image_stream, filename, mime_type
+
 def post_to_facebook(image_stream, filename, caption):
+    ready_stream, ready_name, mime_type = prepare_image_for_fb(image_stream, filename)
     url = f"https://graph.facebook.com/v26.0/{FB_PAGE_ID}/photos"
     payload = {
         "message": caption,
         "access_token": FB_ACCESS_TOKEN
     }
     files = {
-        "source": (filename, image_stream, "image/jpeg")
+        "source": (ready_name, ready_stream, mime_type)
     }
     response = requests.post(url, data=payload, files=files)
     if not response.ok:
