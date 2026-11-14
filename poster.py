@@ -1,37 +1,50 @@
 import os
 import json
 import io
+from datetime import datetime, timezone
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# قراءة المفاتيح السرية
+# قراءة المفاتيح السرية من إعدادات GitHub
 FB_PAGE_ID = os.environ["FB_PAGE_ID"]
 FB_ACCESS_TOKEN = os.environ["FB_ACCESS_TOKEN"]
 PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"]
 POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"]
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 
-# الاتصال بـ Google Drive
-SCOPES = ['https://www.googleapis.com/auth/drive']
+# الاتصال بـ Google Drive و Google Sheets
+SCOPES = [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets'
+]
 creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 drive_service = build('drive', 'v3', credentials=creds)
+sheets_service = build('sheets', 'v4', credentials=creds)
 
-def get_oldest_image():
-    query = f"'{PENDING_FOLDER_ID}' in parents and mimeType contains 'image/' and trashed = false"
-    results = drive_service.files().list(
-        q=query,
-        orderBy="createdTime asc",
-        pageSize=1,
-        fields="files(id, name)"
+def get_next_scheduled_row():
+    """جلب أول صف غير منشور من الجدول"""
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Sheet1!A2:C"
     ).execute()
-    files = results.get('files', [])
-    return files[0] if files else None
+    rows = result.get('values', [])
+    
+    for idx, row in enumerate(rows, start=2):
+        image_name = row[0].strip() if len(row) > 0 else ""
+        caption = row[1].strip() if len(row) > 1 else ""
+        status = row[2].strip().lower() if len(row) > 2 else ""
+        
+        if image_name and status != "posted":
+            return idx, image_name, caption
+    return None, None, None
 
-def get_matching_text_file(base_name):
-    safe_txt_name = f"{base_name}.txt".replace("'", "\\'")
-    query = f"'{PENDING_FOLDER_ID}' in parents and name = '{safe_txt_name}' and trashed = false"
+def find_image_in_drive(filename):
+    """البحث عن الصورة بالاسم داخل مجلد الانتظار"""
+    safe_name = filename.replace("'", "\\'")
+    query = f"'{PENDING_FOLDER_ID}' in parents and name = '{safe_name}' and trashed = false"
     results = drive_service.files().list(
         q=query,
         pageSize=1,
@@ -73,33 +86,32 @@ def move_to_archive(file_id):
         fields='id, parents'
     ).execute()
 
+def mark_row_as_posted(row_number):
+    """تحديث حالة الصف في الجدول وتسجيل وقت النشر"""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    sheets_service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"Sheet1!C{row_number}:D{row_number}",
+        valueInputOption="USER_ENTERED",
+        body={"values": [["Posted", now_str]]}
+    ).execute()
+
 if __name__ == "__main__":
-    image_file = get_oldest_image()
-    if not image_file:
-        print("مجلد الانتظار فارغ، لا توجد صور للنشر حالياً.")
+    row_num, image_name, caption = get_next_scheduled_row()
+    if not image_name:
+        print("لا توجد منشورات جديدة في جدول Google Sheets.")
         exit(0)
 
-    file_id = image_file['id']
-    file_name = image_file['name']
-    base_name = os.path.splitext(file_name)[0]
+    print(f"الصف رقم {row_num}: البحث عن الصورة '{image_name}'...")
+    image_file = find_image_in_drive(image_name)
+    if not image_file:
+        print(f"خطأ: الصورة '{image_name}' غير موجودة في مجلد Pending_Posts!")
+        exit(1)
 
-    # البحث عن ملف نصي بنفس اسم الصورة
-    txt_file = get_matching_text_file(base_name)
-    if txt_file:
-        print(f"تم العثور على ملف نصي مرافق: {txt_file['name']}")
-        txt_stream = download_file(txt_file['id'])
-        caption = txt_stream.read().decode('utf-8').strip()
-    else:
-        # في حال عدم وجود ملف نصي، يستخدم اسم الصورة كعنوان للمنشور
-        caption = base_name.replace("_", " ").replace("-", " ")
-
-    print(f"جاري نشر الصورة: {file_name}")
-    img_data = download_file(file_id)
-    fb_res = post_to_facebook(img_data, file_name, caption)
+    img_data = download_file(image_file['id'])
+    fb_res = post_to_facebook(img_data, image_name, caption)
     print(f"تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
     
-    # نقل الصورة والملف النصي (إن وجد) إلى الأرشيف
-    move_to_archive(file_id)
-    if txt_file:
-        move_to_archive(txt_file['id'])
-    print("تم نقل الملفات إلى مجلد الأرشيف بنجاح.")
+    move_to_archive(image_file['id'])
+    mark_row_as_posted(row_num)
+    print("تم نقل الصورة للأرشيف وتحديث حالة الجدول.")
