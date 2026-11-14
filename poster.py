@@ -30,8 +30,8 @@ def get_oldest_image():
     return files[0] if files else None
 
 def get_matching_text_file(base_name):
-    txt_filename = f"{base_name}.txt"
-    query = f"'{PENDING_FOLDER_ID}' in parents and name = '{txt_filename}' and trashed = false"
+    safe_txt_name = f"{base_name}.txt".replace("'", "\\'")
+    query = f"'{PENDING_FOLDER_ID}' in parents and name = '{safe_txt_name}' and trashed = false"
     results = drive_service.files().list(
         q=query,
         pageSize=1,
@@ -83,14 +83,14 @@ if __name__ == "__main__":
     file_name = image_file['name']
     base_name = os.path.splitext(file_name)[0]
 
-    # البحث عن ملف نصي مطابق لاسم الصورة
+    # البحث عن ملف نصي بنفس اسم الصورة
     txt_file = get_matching_text_file(base_name)
     if txt_file:
         print(f"تم العثور على ملف نصي مرافق: {txt_file['name']}")
         txt_stream = download_file(txt_file['id'])
         caption = txt_stream.read().decode('utf-8').strip()
     else:
-        # في حال عدم وجود ملف نصي، يستخدم اسم الصورة كعنوان
+        # في حال عدم وجود ملف نصي، يستخدم اسم الصورة كعنوان للمنشور
         caption = base_name.replace("_", " ").replace("-", " ")
 
     print(f"جاري نشر الصورة: {file_name}")
@@ -102,4 +102,4 @@ if __name__ == "__main__":
     move_to_archive(file_id)
     if txt_file:
         move_to_archive(txt_file['id'])
-    print("تم نقل الملفات إلى الأرشيف بنجاح.")
+    print("تم نقل الملفات إلى مجلد الأرشيف بنجاح.")
