@@ -2,9 +2,10 @@ name: Hourly Facebook Auto Poster
 
 on:
   schedule:
-    - cron: '15 * * * *'
+    # يعمل كل 10 دقائق على مدار 24 ساعة يومياً
+    - cron: '*/10 * * * *'
   workflow_dispatch:
-
+  
 jobs:
   publish:
     runs-on: ubuntu-latest
