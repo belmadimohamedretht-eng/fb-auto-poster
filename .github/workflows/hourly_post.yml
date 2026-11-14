@@ -26,5 +26,6 @@ jobs:
           FB_ACCESS_TOKEN: ${{ secrets.FB_ACCESS_TOKEN }}
           PENDING_FOLDER_ID: ${{ secrets.PENDING_FOLDER_ID }}
           POSTED_FOLDER_ID: ${{ secrets.POSTED_FOLDER_ID }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
         run: python poster.py
