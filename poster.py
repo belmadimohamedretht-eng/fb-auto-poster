@@ -1,20 +1,24 @@
 import os
 import json
 import io
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# قراءة المفاتيح السرية من إعدادات GitHub
+# قراءة المفاتيح السرية
 FB_PAGE_ID = os.environ["FB_PAGE_ID"]
 FB_ACCESS_TOKEN = os.environ["FB_ACCESS_TOKEN"]
 PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"]
 POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
+
+# توقيت الجزائر (UTC+1) والفاصل الزمني المطلوب (80 دقيقة = ساعة و 20 دقيقة)
+ALGERIA_TZ = timezone(timedelta(hours=1))
+INTERVAL_MINUTES = 80
 
 # الاتصال بـ Google Drive و Google Sheets
 SCOPES = [
@@ -25,14 +29,40 @@ creds = service_account.Credentials.from_service_account_info(creds_dict, scopes
 drive_service = build('drive', 'v3', credentials=creds)
 sheets_service = build('sheets', 'v4', credentials=creds)
 
-def get_next_scheduled_row():
-    """جلب أول صف غير منشور من الجدول"""
-    result = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Sheet1!A2:C"
-    ).execute()
-    rows = result.get('values', [])
+def is_interval_passed(rows):
+    """التحقق من مرور 80 دقيقة على آخر منشور في أي وقت من اليوم"""
+    now_algeria = datetime.now(ALGERIA_TZ).replace(tzinfo=None)
     
+    # السماح بالنشر الفوري عند الضغط على زر Run workflow يدوياً
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        print("تم التشغيل يدوياً: تجاوز شرط الانتظار.")
+        return True
+
+    # البحث عن أحدث وقت نشر في العمود D
+    last_posted_time = None
+    for row in rows:
+        if len(row) > 3 and row[3].strip():
+            try:
+                t = datetime.strptime(row[3].strip(), "%Y-%m-%d %H:%M")
+                if last_posted_time is None or t > last_posted_time:
+                    last_posted_time = t
+            except ValueError:
+                continue
+
+    if last_posted_time is None:
+        return True  # أول منشور في الجدول
+
+    elapsed = (now_algeria - last_posted_time).total_seconds() / 60.0
+    # هامش أمان دقيقتان لتعويض أي تأخير طفيف في سيرفرات GitHub
+    if elapsed >= (INTERVAL_MINUTES - 2):
+        return True
+    else:
+        remaining = int(INTERVAL_MINUTES - elapsed)
+        print(f"مضى {int(elapsed)} دقيقة فقط منذ آخر منشور. المتبقي للنشر القادم: {remaining} دقيقة.")
+        return False
+
+def get_next_scheduled_row(rows):
+    """جلب أول صف غير منشور من الجدول"""
     for idx, row in enumerate(rows, start=2):
         image_name = row[0].strip() if len(row) > 0 else ""
         caption = row[1].strip() if len(row) > 1 else ""
@@ -43,7 +73,6 @@ def get_next_scheduled_row():
     return None, None, None
 
 def find_image_in_drive(filename):
-    """البحث عن الصورة بالاسم داخل مجلد الانتظار"""
     safe_name = filename.replace("'", "\\'")
     query = f"'{PENDING_FOLDER_ID}' in parents and name = '{safe_name}' and trashed = false"
     results = drive_service.files().list(
@@ -65,7 +94,6 @@ def download_file(file_id):
     return fh
 
 def prepare_image_for_fb(image_stream, filename):
-    """تحويل صور WebP إلى JPG في الذاكرة لضمان قبولها 100% في فيسبوك"""
     if filename.lower().endswith(".webp"):
         img = Image.open(image_stream).convert("RGB")
         output_stream = io.BytesIO()
@@ -102,17 +130,26 @@ def move_to_archive(file_id):
     ).execute()
 
 def mark_row_as_posted(row_number):
-    """تحديث حالة الصف في الجدول وتسجيل وقت النشر"""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    """تسجيل حالة النشر ووقت النشر بتوقيت الجزائر في العمودين C و D"""
+    now_str = datetime.now(ALGERIA_TZ).strftime("%Y-%m-%d %H:%M")
     sheets_service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"Sheet1!C{row_number}:D{row_number}",
+        range=f"C{row_number}:D{row_number}",
         valueInputOption="USER_ENTERED",
         body={"values": [["Posted", now_str]]}
     ).execute()
 
 if __name__ == "__main__":
-    row_num, image_name, caption = get_next_scheduled_row()
+    result = sheets_service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range="A2:D"
+    ).execute()
+    rows = result.get('values', [])
+
+    if not is_interval_passed(rows):
+        exit(0)
+
+    row_num, image_name, caption = get_next_scheduled_row(rows)
     if not image_name:
         print("لا توجد منشورات جديدة في جدول Google Sheets.")
         exit(0)
