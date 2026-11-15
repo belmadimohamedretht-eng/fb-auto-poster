@@ -9,7 +9,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # قراءة الإعدادات من متغيرات البيئة
-PAGES_CONFIG = json.loads(os.environ["PAGES_CONFIG"])
+
+raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
+PAGES_CONFIG = json.loads(raw_pages_config)
+
 PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"]
 POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
