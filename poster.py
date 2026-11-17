@@ -106,7 +106,7 @@ def prepare_image_for_fb(image_stream, filename):
 def post_to_facebook(page_id, access_token, image_stream, filename, caption):
     ready_stream, ready_name, mime_type = prepare_image_for_fb(image_stream, filename)
     url = f"https://graph.facebook.com/v26.0/{page_id}/photos"
-  payload = {
+    payload = {
     "message": caption,
     "published": "true",  # هذا المعامل يجبر فيسبوك على إظهار المنشور للعامة فوراً
     "access_token": access_token
