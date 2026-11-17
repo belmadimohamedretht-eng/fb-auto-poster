@@ -20,7 +20,7 @@ creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 
 # توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (80 دقيقة)
 ALGERIA_TZ = timezone(timedelta(hours=1))
-INTERVAL_MINUTES = 80
+INTERVAL_MINUTES = 125
 
 # الاتصال بـ Google Drive و Google Sheets
 SCOPES = [
