@@ -126,7 +126,7 @@ def generate_caption_with_gemini(image_stream, prompt_text):
     image_stream.seek(0)
     img = Image.open(image_stream)
     response = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=[img, prompt_text]
     )
     image_stream.seek(0)
