@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import time
 from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
@@ -122,15 +123,26 @@ def download_file(file_id):
 
 
 def generate_caption_with_gemini(image_stream, prompt_text):
-    """توليد منشور فيسبوك باستخدام البرومت المحدد للصورة أو الصفحة"""
+    """توليد منشور فيسبوك مع إعادة المحاولة تلقائياً والانتقال لنموذج بديل عند الضغط"""
     image_stream.seek(0)
     img = Image.open(image_stream)
-    response = gemini_client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[img, prompt_text]
-    )
-    image_stream.seek(0)
-    return response.text.strip()
+
+    models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.0-flash"]
+
+    for model_name in models_to_try:
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[img, prompt_text]
+                )
+                image_stream.seek(0)
+                return response.text.strip()
+            except Exception:
+                print(f"تنبيه: النموذج {model_name} مشغول (محاولة {attempt + 1})، إعادة المحاولة بعد 5 ثوانٍ...")
+                time.sleep(5)
+
+    raise RuntimeError("جميع نماذج Gemini مشغولة حالياً، سيتم إعادة المحاولة في الدورة القادمة.")
 
 
 def prepare_image_for_fb(image_stream, filename):
