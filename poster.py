@@ -71,8 +71,19 @@ def get_next_scheduled_row(rows):
     return None, None, None
 
 def find_image_in_drive(filename):
-    safe_name = filename.replace("'", "\\'")
-    query = f"'{PENDING_FOLDER_ID}' in parents and name = '{safe_name}' and trashed = false"
+    base_name = os.path.splitext(filename.strip())[0]
+    safe_base = base_name.replace("'", "\\'")
+    
+    possible_names = [
+        f"name = '{safe_base}.webp'",
+        f"name = '{safe_base}.jpg'",
+        f"name = '{safe_base}.jpeg'",
+        f"name = '{safe_base}.png'",
+        f"name = '{safe_base}'"
+    ]
+    names_query = " or ".join(possible_names)
+    query = f"'{PENDING_FOLDER_ID}' in parents and ({names_query}) and trashed = false"
+    
     results = drive_service.files().list(
         q=query,
         pageSize=1,
