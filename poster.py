@@ -2,6 +2,7 @@ import os
 import json
 import io
 import time
+import re
 from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
@@ -33,7 +34,8 @@ DEFAULT_PROMPT = (
     "بدون مقترحات في الاول والأخير\n"
     "بدون طلب حفظ او مشاركة المنشور او سؤال تفاعلي في اخر المنشور.\n"
     "بدون استعمال الهاشتاغ في الاخير.\n"
-    "بدون ذكر المصادر"
+    "بدون ذكر المصادر\n"
+    "اكتب كنص عادي Plain Text بدون استخدام أي علامات تنسيق مثل ** أو #."
 )
 
 # الاتصال بـ Google Drive و Google Sheets
@@ -122,8 +124,16 @@ def download_file(file_id):
     return fh
 
 
+def clean_facebook_caption(text):
+    """إزالة علامات تنسيق Markdown مثل ** و ## ليظهر النص نظيفاً على فيسبوك"""
+    text = text.replace("**", "")
+    text = re.sub(r'^\s*#+\s*', '', text, flags=re.MULTILINE)
+    text = text.replace("\\", "")
+    return text.strip()
+
+
 def generate_caption_with_gemini(image_stream, prompt_text):
-    """توليد منشور فيسبوك مع إعادة المحاولة تلقائياً والانتقال لنموذج بديل عند الضغط"""
+    """توليد منشور فيسبوك مع إعادة المحاولة تلقائياً وتنظيف علامات التنسيق"""
     image_stream.seek(0)
     img = Image.open(image_stream)
 
@@ -137,7 +147,7 @@ def generate_caption_with_gemini(image_stream, prompt_text):
                     contents=[img, prompt_text]
                 )
                 image_stream.seek(0)
-                return response.text.strip()
+                return clean_facebook_caption(response.text)
             except Exception:
                 print(f"تنبيه: النموذج {model_name} مشغول (محاولة {attempt + 1})، إعادة المحاولة بعد 5 ثوانٍ...")
                 time.sleep(5)
@@ -231,6 +241,8 @@ def process_page(page_cfg):
             prompt_source = "العمود E" if custom_prompt else ("إعدادات الصفحة" if page_default_prompt else "الافتراضي العام")
             print(f"[{tab_name}] توليد النص عبر Gemini (المصدر: {prompt_source})...")
             caption = generate_caption_with_gemini(img_data, active_prompt)
+        else:
+            caption = clean_facebook_caption(caption)
 
         fb_res = post_to_facebook(page_id, access_token, img_data, image_file['name'], caption)
         print(f"[{tab_name}] تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
