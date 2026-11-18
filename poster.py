@@ -8,17 +8,16 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# قراءة الإعدادات من متغيرات البيئة
-
+# قراءة الإعدادات من متغيرات البيئة وتنظيف السطور الجديدة
 raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
 PAGES_CONFIG = json.loads(raw_pages_config)
 
-PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"]
-POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"]
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"].strip()
+POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"].strip()
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
 creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 
-# توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (80 دقيقة)
+# توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (ساعتان و 5 دقائق = 125 دقيقة)
 ALGERIA_TZ = timezone(timedelta(hours=1))
 INTERVAL_MINUTES = 125
 
@@ -32,7 +31,7 @@ drive_service = build('drive', 'v3', credentials=creds)
 sheets_service = build('sheets', 'v4', credentials=creds)
 
 def is_interval_passed(rows, tab_name):
-    """التحقق من مرور 80 دقيقة على آخر منشور في هذه الصفحة تحديداً"""
+    """التحقق من مرور 125 دقيقة على آخر منشور في هذه الصفحة تحديداً"""
     now_algeria = datetime.now(ALGERIA_TZ).replace(tzinfo=None)
 
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
@@ -118,10 +117,10 @@ def post_to_facebook(page_id, access_token, image_stream, filename, caption):
     ready_stream, ready_name, mime_type = prepare_image_for_fb(image_stream, filename)
     url = f"https://graph.facebook.com/v26.0/{page_id}/photos"
     payload = {
-    "message": caption,
-    "published": "true",  # هذا المعامل يجبر فيسبوك على إظهار المنشور للعامة فوراً
-    "access_token": access_token
-}
+        "message": caption,
+        "published": "true",
+        "access_token": access_token
+    }
     files = {
         "source": (ready_name, ready_stream, mime_type)
     }
@@ -149,9 +148,9 @@ def mark_row_as_posted(tab_name, row_number):
     ).execute()
 
 def process_page(page_cfg):
-    tab_name = page_cfg["sheet_tab"]
-    page_id = page_cfg["page_id"]
-    access_token = page_cfg["access_token"]
+    tab_name = page_cfg["sheet_tab"].strip()
+    page_id = page_cfg["page_id"].strip()
+    access_token = page_cfg["access_token"].strip().replace("\n", "").replace("\r", "")
 
     print(f"\n--- فحص صفحة: {tab_name} ---")
     try:
@@ -176,7 +175,7 @@ def process_page(page_cfg):
             return
 
         img_data = download_file(image_file['id'])
-        fb_res = post_to_facebook(page_id, access_token, img_data, image_name, caption)
+        fb_res = post_to_facebook(page_id, access_token, img_data, image_file['name'], caption)
         print(f"[{tab_name}] تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
 
         move_to_archive(image_file['id'])
