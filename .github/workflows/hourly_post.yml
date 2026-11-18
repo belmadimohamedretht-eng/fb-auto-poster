@@ -27,4 +27,5 @@ jobs:
           POSTED_FOLDER_ID: ${{ secrets.POSTED_FOLDER_ID }}
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python poster.py
