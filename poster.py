@@ -4,11 +4,12 @@ import io
 from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
+from google import genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# قراءة الإعدادات من متغيرات البيئة وتنظيف السطور الجديدة
+# قراءة الإعدادات من متغيرات البيئة وتنظيف المسافات والسطور الجديدة
 raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
 PAGES_CONFIG = json.loads(raw_pages_config)
 
@@ -16,10 +17,23 @@ PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"].strip()
 POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"].strip()
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
 creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+
+# تهيئة عميل Gemini API
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (ساعتان و 5 دقائق = 125 دقيقة)
 ALGERIA_TZ = timezone(timedelta(hours=1))
 INTERVAL_MINUTES = 125
+
+# البرومت الافتراضي المخصص حسب طلبك
+DEFAULT_PROMPT = (
+    "اكتب منشورا كتابي على صفحة فايسبوك باللغة الانجليزية وباستعمال الإموجي حول محتوى الصورة.\n"
+    "بدون مقترحات في الاول والأخير\n"
+    "بدون طلب حفظ او مشاركة المنشور او سؤال تفاعلي في اخر المنشور.\n"
+    "بدون استعمال الهاشتاغ في الاخير.\n"
+    "بدون ذكر المصادر"
+)
 
 # الاتصال بـ Google Drive و Google Sheets
 SCOPES = [
@@ -29,6 +43,7 @@ SCOPES = [
 creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 drive_service = build('drive', 'v3', credentials=creds)
 sheets_service = build('sheets', 'v4', credentials=creds)
+
 
 def is_interval_passed(rows, tab_name):
     """التحقق من مرور 125 دقيقة على آخر منشور في هذه الصفحة تحديداً"""
@@ -59,20 +74,23 @@ def is_interval_passed(rows, tab_name):
         print(f"[{tab_name}] مضى {int(elapsed)} دقيقة فقط. المتبقي: {remaining} دقيقة.")
         return False
 
+
 def get_next_scheduled_row(rows):
     for idx, row in enumerate(rows, start=2):
         image_name = row[0].strip() if len(row) > 0 else ""
         caption = row[1].strip() if len(row) > 1 else ""
         status = row[2].strip().lower() if len(row) > 2 else ""
-        
+        custom_prompt = row[4].strip() if len(row) > 4 else ""
+
         if image_name and status != "posted":
-            return idx, image_name, caption
-    return None, None, None
+            return idx, image_name, caption, custom_prompt
+    return None, None, None, None
+
 
 def find_image_in_drive(filename):
     base_name = os.path.splitext(filename.strip())[0]
     safe_base = base_name.replace("'", "\\'")
-    
+
     possible_names = [
         f"name = '{safe_base}.webp'",
         f"name = '{safe_base}.jpg'",
@@ -82,7 +100,7 @@ def find_image_in_drive(filename):
     ]
     names_query = " or ".join(possible_names)
     query = f"'{PENDING_FOLDER_ID}' in parents and ({names_query}) and trashed = false"
-    
+
     results = drive_service.files().list(
         q=query,
         pageSize=1,
@@ -90,6 +108,7 @@ def find_image_in_drive(filename):
     ).execute()
     files = results.get('files', [])
     return files[0] if files else None
+
 
 def download_file(file_id):
     request = drive_service.files().get_media(fileId=file_id)
@@ -101,7 +120,21 @@ def download_file(file_id):
     fh.seek(0)
     return fh
 
+
+def generate_caption_with_gemini(image_stream, prompt_text):
+    """توليد منشور فيسبوك باستخدام البرومت المحدد للصورة أو الصفحة"""
+    image_stream.seek(0)
+    img = Image.open(image_stream)
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[img, prompt_text]
+    )
+    image_stream.seek(0)
+    return response.text.strip()
+
+
 def prepare_image_for_fb(image_stream, filename):
+    image_stream.seek(0)
     if filename.lower().endswith(".webp"):
         img = Image.open(image_stream).convert("RGB")
         output_stream = io.BytesIO()
@@ -109,9 +142,10 @@ def prepare_image_for_fb(image_stream, filename):
         output_stream.seek(0)
         new_filename = os.path.splitext(filename)[0] + ".jpg"
         return output_stream, new_filename, "image/jpeg"
-    
+
     mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
     return image_stream, filename, mime_type
+
 
 def post_to_facebook(page_id, access_token, image_stream, filename, caption):
     ready_stream, ready_name, mime_type = prepare_image_for_fb(image_stream, filename)
@@ -130,6 +164,7 @@ def post_to_facebook(page_id, access_token, image_stream, filename, caption):
     response.raise_for_status()
     return response.json()
 
+
 def move_to_archive(file_id):
     drive_service.files().update(
         fileId=file_id,
@@ -138,32 +173,35 @@ def move_to_archive(file_id):
         fields='id, parents'
     ).execute()
 
-def mark_row_as_posted(tab_name, row_number):
+
+def update_sheet_row(tab_name, row_number, caption):
     now_str = datetime.now(ALGERIA_TZ).strftime("%Y-%m-%d %H:%M")
     sheets_service.spreadsheets().values().update(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"'{tab_name}'!C{row_number}:D{row_number}",
+        range=f"'{tab_name}'!B{row_number}:D{row_number}",
         valueInputOption="USER_ENTERED",
-        body={"values": [["Posted", now_str]]}
+        body={"values": [[caption, "Posted", now_str]]}
     ).execute()
+
 
 def process_page(page_cfg):
     tab_name = page_cfg["sheet_tab"].strip()
     page_id = page_cfg["page_id"].strip()
     access_token = page_cfg["access_token"].strip().replace("\n", "").replace("\r", "")
+    page_default_prompt = page_cfg.get("prompt", "").strip()
 
     print(f"\n--- فحص صفحة: {tab_name} ---")
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{tab_name}'!A2:D"
+            range=f"'{tab_name}'!A2:E"
         ).execute()
         rows = result.get('values', [])
 
         if not is_interval_passed(rows, tab_name):
             return
 
-        row_num, image_name, caption = get_next_scheduled_row(rows)
+        row_num, image_name, caption, custom_prompt = get_next_scheduled_row(rows)
         if not image_name:
             print(f"[{tab_name}] لا توجد منشورات جديدة في هذا التبويب.")
             return
@@ -175,15 +213,23 @@ def process_page(page_cfg):
             return
 
         img_data = download_file(image_file['id'])
+
+        if not caption:
+            active_prompt = custom_prompt or page_default_prompt or DEFAULT_PROMPT
+            prompt_source = "العمود E" if custom_prompt else ("إعدادات الصفحة" if page_default_prompt else "الافتراضي العام")
+            print(f"[{tab_name}] توليد النص عبر Gemini (المصدر: {prompt_source})...")
+            caption = generate_caption_with_gemini(img_data, active_prompt)
+
         fb_res = post_to_facebook(page_id, access_token, img_data, image_file['name'], caption)
         print(f"[{tab_name}] تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
 
         move_to_archive(image_file['id'])
-        mark_row_as_posted(tab_name, row_num)
-        print(f"[{tab_name}] تم أرشفة الصورة وتحديث الجدول.")
+        update_sheet_row(tab_name, row_num, caption)
+        print(f"[{tab_name}] تم أرشفة الصورة وحفظ النص وتحديث الجدول.")
 
     except Exception as e:
         print(f"[{tab_name}] حدث خطأ أثناء معالجة هذه الصفحة: {e}")
+
 
 if __name__ == "__main__":
     for page in PAGES_CONFIG:
