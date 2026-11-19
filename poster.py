@@ -15,6 +15,10 @@ from googleapiclient.http import MediaIoBaseDownload
 raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
 PAGES_CONFIG = json.loads(raw_pages_config)
 
+# قاموس التوكنات: يدعم { "اسم_الحساب": { "اسم_التبويب_أو_PageID": "التوكن" } } أو { "اسم_الحساب": "التوكن" }
+raw_tokens_config = os.environ.get("TOKENS_CONFIG", "{}").replace("\r", "").replace("\n", "").strip()
+TOKENS_CONFIG = json.loads(raw_tokens_config) if raw_tokens_config else {}
+
 PENDING_FOLDER_ID = os.environ["PENDING_FOLDER_ID"].strip()
 POSTED_FOLDER_ID = os.environ["POSTED_FOLDER_ID"].strip()
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
@@ -84,10 +88,11 @@ def get_next_scheduled_row(rows):
         caption = row[1].strip() if len(row) > 1 else ""
         status = row[2].strip().lower() if len(row) > 2 else ""
         custom_prompt = row[4].strip() if len(row) > 4 else ""
+        account_name = row[5].strip() if len(row) > 5 else ""
 
         if image_name and status != "posted":
-            return idx, image_name, caption, custom_prompt
-    return None, None, None, None
+            return idx, image_name, caption, custom_prompt, account_name
+    return None, None, None, None, None
 
 
 def find_image_in_drive(filename):
@@ -206,27 +211,65 @@ def update_sheet_row(tab_name, row_number, caption):
     ).execute()
 
 
+def resolve_access_token(account_name, tab_name, page_id, default_token):
+    """جلب التوكن المناسب للحساب والصفحة من TOKENS_CONFIG أو PAGES_CONFIG"""
+    if not account_name:
+        return default_token
+
+    acc_clean = account_name.strip().lower()
+    tab_clean = tab_name.strip().lower()
+    pid_clean = page_id.strip().lower()
+
+    # البحث في قاموس TOKENS_CONFIG
+    for k, v in TOKENS_CONFIG.items():
+        if k.strip().lower() == acc_clean:
+            # إذا كانت قيمة الحساب قاموساً يحتوي على توكنات لكل صفحة
+            if isinstance(v, dict):
+                for page_key, tok in v.items():
+                    pk_clean = str(page_key).strip().lower()
+                    if pk_clean in (tab_clean, pid_clean) and str(tok).strip():
+                        print(f"[{tab_name}] استخدام توكن الحساب '{k.strip()}' المخصص لهذه الصفحة.")
+                        return str(tok).strip().replace("\n", "").replace("\r", "")
+                print(f"[{tab_name}] تحذير: الحساب '{k.strip()}' لا يملك توكناً مسجلاً لهذه الصفحة، سيتم استخدام الافتراضي.")
+                return default_token
+            # إذا كانت قيمة الحساب نصاً مباشراً (توكن عام للحساب)
+            elif isinstance(v, str) and v.strip():
+                print(f"[{tab_name}] استخدام التوكن العام للحساب '{k.strip()}'.")
+                return v.strip().replace("\n", "").replace("\r", "")
+
+    # البحث في PAGES_CONFIG إذا كان الاسم مسجلاً هناك
+    for p in PAGES_CONFIG:
+        if p.get("name", "").strip().lower() == acc_clean and p.get("access_token", "").strip():
+            print(f"[{tab_name}] استخدام توكن الحساب '{p.get('name').strip()}' من PAGES_CONFIG.")
+            return p["access_token"].strip().replace("\n", "").replace("\r", "")
+
+    print(f"[{tab_name}] تحذير: لم يتم العثور على الحساب '{account_name}'، سيتم استخدام التوكن الافتراضي.")
+    return default_token
+
+
 def process_page(page_cfg):
     tab_name = page_cfg["sheet_tab"].strip()
     page_id = page_cfg["page_id"].strip()
-    access_token = page_cfg["access_token"].strip().replace("\n", "").replace("\r", "")
+    default_access_token = page_cfg["access_token"].strip().replace("\n", "").replace("\r", "")
     page_default_prompt = page_cfg.get("prompt", "").strip()
 
     print(f"\n--- فحص صفحة: {tab_name} ---")
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{tab_name}'!A2:E"
+            range=f"'{tab_name}'!A2:F"
         ).execute()
         rows = result.get('values', [])
 
         if not is_interval_passed(rows, tab_name):
             return
 
-        row_num, image_name, caption, custom_prompt = get_next_scheduled_row(rows)
+        row_num, image_name, caption, custom_prompt, account_name = get_next_scheduled_row(rows)
         if not image_name:
             print(f"[{tab_name}] لا توجد منشورات جديدة في هذا التبويب.")
             return
+
+        active_access_token = resolve_access_token(account_name, tab_name, page_id, default_access_token)
 
         print(f"[{tab_name}] الصف {row_num}: البحث عن '{image_name}'...")
         image_file = find_image_in_drive(image_name)
@@ -244,7 +287,7 @@ def process_page(page_cfg):
         else:
             caption = clean_facebook_caption(caption)
 
-        fb_res = post_to_facebook(page_id, access_token, img_data, image_file['name'], caption)
+        fb_res = post_to_facebook(page_id, active_access_token, img_data, image_file['name'], caption)
         print(f"[{tab_name}] تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
 
         move_to_archive(image_file['id'])
