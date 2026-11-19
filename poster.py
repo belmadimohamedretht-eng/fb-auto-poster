@@ -3,6 +3,7 @@ import json
 import io
 import time
 import re
+import tempfile
 from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
@@ -15,7 +16,6 @@ from googleapiclient.http import MediaIoBaseDownload
 raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
 PAGES_CONFIG = json.loads(raw_pages_config)
 
-# قاموس التوكنات: يدعم { "اسم_الحساب": { "اسم_التبويب_أو_PageID": "التوكن" } } أو { "اسم_الحساب": "التوكن" }
 raw_tokens_config = os.environ.get("TOKENS_CONFIG", "{}").replace("\r", "").replace("\n", "").strip()
 TOKENS_CONFIG = json.loads(raw_tokens_config) if raw_tokens_config else {}
 
@@ -28,11 +28,13 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 # تهيئة عميل Gemini API
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (ساعتان و 5 دقائق = 125 دقيقة)
+# توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (125 دقيقة)
 ALGERIA_TZ = timezone(timedelta(hours=1))
 INTERVAL_MINUTES = 125
 
-# البرومت الافتراضي المخصص حسب طلبك
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
+
+# البرومت الافتراضي للصور (منشور كامل)
 DEFAULT_PROMPT = (
     "اكتب منشورا كتابي على صفحة فايسبوك باللغة الانجليزية وباستعمال الإموجي حول محتوى الصورة.\n"
     "بدون مقترحات في الاول والأخير\n"
@@ -40,6 +42,14 @@ DEFAULT_PROMPT = (
     "بدون استعمال الهاشتاغ في الاخير.\n"
     "بدون ذكر المصادر\n"
     "اكتب كنص عادي Plain Text بدون استخدام أي علامات تنسيق مثل ** أو #."
+)
+
+# البرومت الافتراضي للفيديوهات القصيرة Reels (عنوان قصير فقط باللغة الإنجليزية)
+DEFAULT_VIDEO_PROMPT = (
+    "Write ONLY a short, catchy, single-line title in English with 1 or 2 relevant emojis describing the content of this video.\n"
+    "Keep it concise (maximum 10 words).\n"
+    "Do NOT write a full description, paragraphs, intro, outro, questions, calls to action, or hashtags.\n"
+    "Output plain text only without any markdown symbols like ** or #."
 )
 
 # الاتصال بـ Google Drive و Google Sheets
@@ -84,18 +94,19 @@ def is_interval_passed(rows, tab_name):
 
 def get_next_scheduled_row(rows):
     for idx, row in enumerate(rows, start=2):
-        image_name = row[0].strip() if len(row) > 0 else ""
+        media_name = row[0].strip() if len(row) > 0 else ""
         caption = row[1].strip() if len(row) > 1 else ""
         status = row[2].strip().lower() if len(row) > 2 else ""
         custom_prompt = row[4].strip() if len(row) > 4 else ""
         account_name = row[5].strip() if len(row) > 5 else ""
 
-        if image_name and status != "posted":
-            return idx, image_name, caption, custom_prompt, account_name
+        if media_name and status != "posted":
+            return idx, media_name, caption, custom_prompt, account_name
     return None, None, None, None, None
 
 
-def find_image_in_drive(filename):
+def find_media_in_drive(filename):
+    """البحث عن الصورة أو الفيديو في مجلد Pending_Posts"""
     base_name = os.path.splitext(filename.strip())[0]
     safe_base = base_name.replace("'", "\\'")
 
@@ -104,6 +115,9 @@ def find_image_in_drive(filename):
         f"name = '{safe_base}.jpg'",
         f"name = '{safe_base}.jpeg'",
         f"name = '{safe_base}.png'",
+        f"name = '{safe_base}.mp4'",
+        f"name = '{safe_base}.mov'",
+        f"name = '{safe_base}.mkv'",
         f"name = '{safe_base}'"
     ]
     names_query = " or ".join(possible_names)
@@ -112,7 +126,7 @@ def find_image_in_drive(filename):
     results = drive_service.files().list(
         q=query,
         pageSize=1,
-        fields="files(id, name)"
+        fields="files(id, name, mimeType)"
     ).execute()
     files = results.get('files', [])
     return files[0] if files else None
@@ -129,6 +143,12 @@ def download_file(file_id):
     return fh
 
 
+def is_video_file(file_info):
+    name = file_info.get("name", "").lower()
+    mime = file_info.get("mimeType", "").lower()
+    return name.endswith(VIDEO_EXTENSIONS) or mime.startswith("video/")
+
+
 def clean_facebook_caption(text):
     """إزالة علامات تنسيق Markdown مثل ** و ## ليظهر النص نظيفاً على فيسبوك"""
     text = text.replace("**", "")
@@ -137,8 +157,8 @@ def clean_facebook_caption(text):
     return text.strip()
 
 
-def generate_caption_with_gemini(image_stream, prompt_text):
-    """توليد منشور فيسبوك مع إعادة المحاولة تلقائياً وتنظيف علامات التنسيق"""
+def generate_caption_for_image(image_stream, prompt_text):
+    """توليد منشور لصورة عبر Gemini"""
     image_stream.seek(0)
     img = Image.open(image_stream)
 
@@ -160,6 +180,58 @@ def generate_caption_with_gemini(image_stream, prompt_text):
     raise RuntimeError("جميع نماذج Gemini مشغولة حالياً، سيتم إعادة المحاولة في الدورة القادمة.")
 
 
+def generate_caption_for_video(video_stream, filename, prompt_text):
+    """رفع الفيديو مؤقتاً إلى Gemini وتحليله لتوليد عنوان قصير بالإنجليزية ثم حذفه"""
+    video_stream.seek(0)
+    ext = os.path.splitext(filename)[1] or ".mp4"
+    tmp_path = None
+    uploaded_file = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(video_stream.read())
+            tmp_path = tmp.name
+
+        uploaded_file = gemini_client.files.upload(file=tmp_path)
+
+        while uploaded_file.state.name == "PROCESSING":
+            time.sleep(3)
+            uploaded_file = gemini_client.files.get(name=uploaded_file.name)
+
+        if uploaded_file.state.name == "FAILED":
+            raise RuntimeError("فشلت معالجة الفيديو في Gemini.")
+
+        models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.0-flash"]
+        for model_name in models_to_try:
+            for attempt in range(2):
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=[uploaded_file, prompt_text]
+                    )
+                    video_stream.seek(0)
+                    # أخذ السطر الأول فقط وتنظيفه لضمان بقائه عنواناً قصيراً
+                    title = clean_facebook_caption(response.text).splitlines()[0].strip()
+                    return title
+                except Exception:
+                    print(f"تنبيه: النموذج {model_name} مشغول للفيديو (محاولة {attempt + 1})...")
+                    time.sleep(5)
+
+        raise RuntimeError("جميع نماذج Gemini مشغولة حالياً لمعالجة الفيديو.")
+    finally:
+        video_stream.seek(0)
+        if uploaded_file:
+            try:
+                gemini_client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
 def prepare_image_for_fb(image_stream, filename):
     image_stream.seek(0)
     if filename.lower().endswith(".webp"):
@@ -174,7 +246,7 @@ def prepare_image_for_fb(image_stream, filename):
     return image_stream, filename, mime_type
 
 
-def post_to_facebook(page_id, access_token, image_stream, filename, caption):
+def post_photo_to_facebook(page_id, access_token, image_stream, filename, caption):
     ready_stream, ready_name, mime_type = prepare_image_for_fb(image_stream, filename)
     url = f"https://graph.facebook.com/v26.0/{page_id}/photos"
     payload = {
@@ -187,9 +259,57 @@ def post_to_facebook(page_id, access_token, image_stream, filename, caption):
     }
     response = requests.post(url, data=payload, files=files)
     if not response.ok:
-        print(f"تفاصيل خطأ فيسبوك للصفحة {page_id}:", response.text)
+        print(f"تفاصيل خطأ نشر الصورة للصفحة {page_id}:", response.text)
     response.raise_for_status()
     return response.json()
+
+
+def post_reel_to_facebook(page_id, access_token, video_stream, caption):
+    """نشر الفيديو القصير كـ Facebook Reel عبر 3 مراحل رسمية"""
+    video_stream.seek(0)
+    video_bytes = video_stream.read()
+    file_size = len(video_bytes)
+
+    base_url = f"https://graph.facebook.com/v26.0/{page_id}/video_reels"
+
+    # المرحلة 1: تهيئة جلسة الرفع
+    init_res = requests.post(base_url, data={
+        "upload_phase": "start",
+        "access_token": access_token
+    })
+    if not init_res.ok:
+        print(f"خطأ تهيئة رفع Reel للصفحة {page_id}:", init_res.text)
+    init_res.raise_for_status()
+    init_data = init_res.json()
+
+    video_id = init_data["video_id"]
+    upload_url = init_data["upload_url"]
+
+    # المرحلة 2: رفع بيانات الفيديو
+    upload_headers = {
+        "Authorization": f"OAuth {access_token}",
+        "offset": "0",
+        "file_size": str(file_size),
+        "Content-Type": "application/octet-stream"
+    }
+    up_res = requests.post(upload_url, headers=upload_headers, data=video_bytes)
+    if not up_res.ok:
+        print(f"خطأ رفع ملف الفيديو Reel للصفحة {page_id}:", up_res.text)
+    up_res.raise_for_status()
+
+    # المرحلة 3: إنهاء الرفع ونشر الـ Reel مع العنوان
+    finish_res = requests.post(base_url, data={
+        "upload_phase": "finish",
+        "video_id": video_id,
+        "video_state": "PUBLISHED",
+        "description": caption,
+        "access_token": access_token
+    })
+    if not finish_res.ok:
+        print(f"خطأ نشر Reel النهائي للصفحة {page_id}:", finish_res.text)
+    finish_res.raise_for_status()
+
+    return {"id": video_id, "details": finish_res.json()}
 
 
 def move_to_archive(file_id):
@@ -212,7 +332,6 @@ def update_sheet_row(tab_name, row_number, caption):
 
 
 def resolve_access_token(account_name, tab_name, page_id, default_token):
-    """جلب التوكن المناسب للحساب والصفحة من TOKENS_CONFIG أو PAGES_CONFIG"""
     if not account_name:
         return default_token
 
@@ -220,10 +339,8 @@ def resolve_access_token(account_name, tab_name, page_id, default_token):
     tab_clean = tab_name.strip().lower()
     pid_clean = page_id.strip().lower()
 
-    # البحث في قاموس TOKENS_CONFIG
     for k, v in TOKENS_CONFIG.items():
         if k.strip().lower() == acc_clean:
-            # إذا كانت قيمة الحساب قاموساً يحتوي على توكنات لكل صفحة
             if isinstance(v, dict):
                 for page_key, tok in v.items():
                     pk_clean = str(page_key).strip().lower()
@@ -232,12 +349,10 @@ def resolve_access_token(account_name, tab_name, page_id, default_token):
                         return str(tok).strip().replace("\n", "").replace("\r", "")
                 print(f"[{tab_name}] تحذير: الحساب '{k.strip()}' لا يملك توكناً مسجلاً لهذه الصفحة، سيتم استخدام الافتراضي.")
                 return default_token
-            # إذا كانت قيمة الحساب نصاً مباشراً (توكن عام للحساب)
             elif isinstance(v, str) and v.strip():
                 print(f"[{tab_name}] استخدام التوكن العام للحساب '{k.strip()}'.")
                 return v.strip().replace("\n", "").replace("\r", "")
 
-    # البحث في PAGES_CONFIG إذا كان الاسم مسجلاً هناك
     for p in PAGES_CONFIG:
         if p.get("name", "").strip().lower() == acc_clean and p.get("access_token", "").strip():
             print(f"[{tab_name}] استخدام توكن الحساب '{p.get('name').strip()}' من PAGES_CONFIG.")
@@ -264,35 +379,47 @@ def process_page(page_cfg):
         if not is_interval_passed(rows, tab_name):
             return
 
-        row_num, image_name, caption, custom_prompt, account_name = get_next_scheduled_row(rows)
-        if not image_name:
+        row_num, media_name, caption, custom_prompt, account_name = get_next_scheduled_row(rows)
+        if not media_name:
             print(f"[{tab_name}] لا توجد منشورات جديدة في هذا التبويب.")
             return
 
         active_access_token = resolve_access_token(account_name, tab_name, page_id, default_access_token)
 
-        print(f"[{tab_name}] الصف {row_num}: البحث عن '{image_name}'...")
-        image_file = find_image_in_drive(image_name)
-        if not image_file:
-            print(f"[{tab_name}] تحذير: الصورة '{image_name}' غير موجودة في مجلد Pending_Posts!")
+        print(f"[{tab_name}] الصف {row_num}: البحث عن '{media_name}'...")
+        media_file = find_media_in_drive(media_name)
+        if not media_file:
+            print(f"[{tab_name}] تحذير: الملف '{media_name}' غير موجود في مجلد Pending_Posts!")
             return
 
-        img_data = download_file(image_file['id'])
+        media_data = download_file(media_file['id'])
+        is_video = is_video_file(media_file)
 
         if not caption:
-            active_prompt = custom_prompt or page_default_prompt or DEFAULT_PROMPT
-            prompt_source = "العمود E" if custom_prompt else ("إعدادات الصفحة" if page_default_prompt else "الافتراضي العام")
-            print(f"[{tab_name}] توليد النص عبر Gemini (المصدر: {prompt_source})...")
-            caption = generate_caption_with_gemini(img_data, active_prompt)
+            if is_video:
+                active_prompt = custom_prompt or DEFAULT_VIDEO_PROMPT
+                prompt_source = "العمود E" if custom_prompt else "عنوان Reel الافتراضي"
+                print(f"[{tab_name}] تحليل الفيديو وتوليد عنوان Reel بالإنجليزية (المصدر: {prompt_source})...")
+                caption = generate_caption_for_video(media_data, media_file['name'], active_prompt)
+            else:
+                active_prompt = custom_prompt or page_default_prompt or DEFAULT_PROMPT
+                prompt_source = "العمود E" if custom_prompt else ("إعدادات الصفحة" if page_default_prompt else "الافتراضي العام")
+                print(f"[{tab_name}] توليد نص الصورة عبر Gemini (المصدر: {prompt_source})...")
+                caption = generate_caption_for_image(media_data, active_prompt)
         else:
             caption = clean_facebook_caption(caption)
 
-        fb_res = post_to_facebook(page_id, active_access_token, img_data, image_file['name'], caption)
-        print(f"[{tab_name}] تم النشر بنجاح! رقم المنشور: {fb_res.get('id')}")
+        if is_video:
+            print(f"[{tab_name}] جاري رفع ونشر الفيديو كـ Reel بعنوان: {caption}")
+            fb_res = post_reel_to_facebook(page_id, active_access_token, media_data, caption)
+            print(f"[{tab_name}] تم نشر الـ Reel بنجاح! معرف الفيديو: {fb_res.get('id')}")
+        else:
+            fb_res = post_photo_to_facebook(page_id, active_access_token, media_data, media_file['name'], caption)
+            print(f"[{tab_name}] تم نشر الصورة بنجاح! رقم المنشور: {fb_res.get('id')}")
 
-        move_to_archive(image_file['id'])
+        move_to_archive(media_file['id'])
         update_sheet_row(tab_name, row_num, caption)
-        print(f"[{tab_name}] تم أرشفة الصورة وحفظ النص وتحديث الجدول.")
+        print(f"[{tab_name}] تم أرشفة الملف وحفظ العنوان/النص وتحديث الجدول.")
 
     except Exception as e:
         print(f"[{tab_name}] حدث خطأ أثناء معالجة هذه الصفحة: {e}")
