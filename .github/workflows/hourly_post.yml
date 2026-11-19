@@ -28,4 +28,5 @@ jobs:
           SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TOKENS_CONFIG: ${{ secrets.TOKENS_CONFIG }}
         run: python poster.py
