@@ -220,7 +220,7 @@ def generate_caption_for_image(image_stream, prompt_text):
     image_stream.seek(0)
     img = Image.open(image_stream)
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 
     for model_name in models_to_try:
         for attempt in range(2):
@@ -259,7 +259,7 @@ def generate_caption_for_video(video_stream, filename, prompt_text):
         if uploaded_file.state.name == "FAILED":
             raise RuntimeError("فشلت معالجة الفيديو في Gemini.")
 
-        models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
         for model_name in models_to_try:
             for attempt in range(2):
                 try:
@@ -270,8 +270,8 @@ def generate_caption_for_video(video_stream, filename, prompt_text):
                     video_stream.seek(0)
                     title = clean_facebook_caption(response.text).splitlines()[0].strip()
                     return title
-                except Exception:
-                    print(f"تنبيه: النموذج {model_name} مشغول للفيديو (محاولة {attempt + 1})...")
+                except Exception as e:
+                    print(f"تنبيه: النموذج {model_name} مشغول للفيديو (محاولة {attempt + 1}): {e}")
                     time.sleep(5)
 
         raise RuntimeError("جميع نماذج Gemini مشغولة حالياً لمعالجة الفيديو.")
