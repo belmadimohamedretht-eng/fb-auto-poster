@@ -8,9 +8,10 @@ from datetime import datetime, timezone, timedelta
 import requests
 from PIL import Image
 from google import genai
+from google.genai import types
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 # قراءة الإعدادات من متغيرات البيئة وتنظيف المسافات والسطور الجديدة
 raw_pages_config = os.environ["PAGES_CONFIG"].replace("\r", "").replace("\n", "")
@@ -25,7 +26,7 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
 creds_dict = json.loads(os.environ["GDRIVE_CREDENTIALS"])
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 
-# تهيئة عميل Gemini API
+# تهيئة عميل Google AI (Gemini)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # توقيت الجزائر (UTC+1) والفاصل الزمني لكل صفحة (125 دقيقة)
@@ -34,7 +35,7 @@ INTERVAL_MINUTES = 125
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
 
-# البرومت الافتراضي للصور (منشور كامل)
+# البرومت الافتراضي لنص المنشور للصور
 DEFAULT_PROMPT = (
     "اكتب منشورا كتابي على صفحة فايسبوك باللغة الانجليزية وباستعمال الإموجي حول محتوى الصورة.\n"
     "بدون مقترحات في الاول والأخير\n"
@@ -93,16 +94,73 @@ def is_interval_passed(rows, tab_name):
 
 
 def get_next_scheduled_row(rows):
+    """قراءة الصف التالي من الأعمدة A إلى G"""
     for idx, row in enumerate(rows, start=2):
         media_name = row[0].strip() if len(row) > 0 else ""
         caption = row[1].strip() if len(row) > 1 else ""
         status = row[2].strip().lower() if len(row) > 2 else ""
         custom_prompt = row[4].strip() if len(row) > 4 else ""
         account_name = row[5].strip() if len(row) > 5 else ""
+        image_edit_prompt = row[6].strip() if len(row) > 6 else ""
 
         if media_name and status != "posted":
-            return idx, media_name, caption, custom_prompt, account_name
-    return None, None, None, None, None
+            return idx, media_name, caption, custom_prompt, account_name, image_edit_prompt
+    return None, None, None, None, None, None
+
+
+def recreate_image_with_gemini(source_image_stream, image_prompt, aspect_ratio="4:5"):
+    """إنشاء صورة جديدة اعتماداً على الصورة المرفوعة + البرومت عبر Google AI API المدفوع"""
+    source_image_stream.seek(0)
+    pil_img = Image.open(source_image_stream)
+
+    image_models = ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"]
+
+    last_error = None
+    for model_name in image_models:
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[pil_img, image_prompt],
+                    config=types.GenerateContentConfig(
+                        response_modalities=["IMAGE"],
+                        image_config=types.ImageConfig(
+                            aspect_ratio=aspect_ratio
+                        )
+                    )
+                )
+
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        out_stream = io.BytesIO(part.inline_data.data)
+                        out_stream.seek(0)
+                        new_filename = f"ai_recreated_{datetime.now(ALGERIA_TZ).strftime('%Y%m%d_%H%M%S')}.jpg"
+                        source_image_stream.seek(0)
+                        return out_stream, new_filename
+
+                raise RuntimeError("النموذج لم يُرجع بيانات صورة في الاستجابة.")
+            except Exception as e:
+                last_error = e
+                print(f"تنبيه أثناء إعادة صياغة الصورة عبر {model_name} (محاولة {attempt + 1}): {e}")
+                time.sleep(5)
+
+    raise RuntimeError(f"فشل إعادة صياغة الصورة عبر Google AI: {last_error}")
+
+
+def upload_image_to_archive(image_stream, filename):
+    """حفظ نسخة من الصورة الجديدة المولدة في مجلد الأرشيف Posted_Posts"""
+    image_stream.seek(0)
+    file_metadata = {
+        "name": filename,
+        "parents": [POSTED_FOLDER_ID]
+    }
+    media = MediaIoBaseUpload(image_stream, mimetype="image/jpeg", resumable=False)
+    drive_service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id"
+    ).execute()
+    image_stream.seek(0)
 
 
 def find_media_in_drive(filename):
@@ -162,7 +220,7 @@ def generate_caption_for_image(image_stream, prompt_text):
     image_stream.seek(0)
     img = Image.open(image_stream)
 
-    models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.0-flash"]
+    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
     for model_name in models_to_try:
         for attempt in range(2):
@@ -173,8 +231,8 @@ def generate_caption_for_image(image_stream, prompt_text):
                 )
                 image_stream.seek(0)
                 return clean_facebook_caption(response.text)
-            except Exception:
-                print(f"تنبيه: النموذج {model_name} مشغول (محاولة {attempt + 1})، إعادة المحاولة بعد 5 ثوانٍ...")
+            except Exception as e:
+                print(f"تنبيه: النموذج {model_name} مشغول (محاولة {attempt + 1}): {e}")
                 time.sleep(5)
 
     raise RuntimeError("جميع نماذج Gemini مشغولة حالياً، سيتم إعادة المحاولة في الدورة القادمة.")
@@ -201,7 +259,7 @@ def generate_caption_for_video(video_stream, filename, prompt_text):
         if uploaded_file.state.name == "FAILED":
             raise RuntimeError("فشلت معالجة الفيديو في Gemini.")
 
-        models_to_try = ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.0-flash"]
+        models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
         for model_name in models_to_try:
             for attempt in range(2):
                 try:
@@ -210,7 +268,6 @@ def generate_caption_for_video(video_stream, filename, prompt_text):
                         contents=[uploaded_file, prompt_text]
                     )
                     video_stream.seek(0)
-                    # أخذ السطر الأول فقط وتنظيفه لضمان بقائه عنواناً قصيراً
                     title = clean_facebook_caption(response.text).splitlines()[0].strip()
                     return title
                 except Exception:
@@ -234,16 +291,12 @@ def generate_caption_for_video(video_stream, filename, prompt_text):
 
 def prepare_image_for_fb(image_stream, filename):
     image_stream.seek(0)
-    if filename.lower().endswith(".webp"):
-        img = Image.open(image_stream).convert("RGB")
-        output_stream = io.BytesIO()
-        img.save(output_stream, format="JPEG", quality=95)
-        output_stream.seek(0)
-        new_filename = os.path.splitext(filename)[0] + ".jpg"
-        return output_stream, new_filename, "image/jpeg"
-
-    mime_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-    return image_stream, filename, mime_type
+    img = Image.open(image_stream).convert("RGB")
+    output_stream = io.BytesIO()
+    img.save(output_stream, format="JPEG", quality=95)
+    output_stream.seek(0)
+    new_filename = os.path.splitext(filename)[0] + ".jpg"
+    return output_stream, new_filename, "image/jpeg"
 
 
 def post_photo_to_facebook(page_id, access_token, image_stream, filename, caption):
@@ -272,7 +325,6 @@ def post_reel_to_facebook(page_id, access_token, video_stream, caption):
 
     base_url = f"https://graph.facebook.com/v26.0/{page_id}/video_reels"
 
-    # المرحلة 1: تهيئة جلسة الرفع
     init_res = requests.post(base_url, data={
         "upload_phase": "start",
         "access_token": access_token
@@ -285,7 +337,6 @@ def post_reel_to_facebook(page_id, access_token, video_stream, caption):
     video_id = init_data["video_id"]
     upload_url = init_data["upload_url"]
 
-    # المرحلة 2: رفع بيانات الفيديو
     upload_headers = {
         "Authorization": f"OAuth {access_token}",
         "offset": "0",
@@ -297,7 +348,6 @@ def post_reel_to_facebook(page_id, access_token, video_stream, caption):
         print(f"خطأ رفع ملف الفيديو Reel للصفحة {page_id}:", up_res.text)
     up_res.raise_for_status()
 
-    # المرحلة 3: إنهاء الرفع ونشر الـ Reel مع العنوان
     finish_res = requests.post(base_url, data={
         "upload_phase": "finish",
         "video_id": video_id,
@@ -372,21 +422,21 @@ def process_page(page_cfg):
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{tab_name}'!A2:F"
+            range=f"'{tab_name}'!A2:G"
         ).execute()
         rows = result.get('values', [])
 
         if not is_interval_passed(rows, tab_name):
             return
 
-        row_num, media_name, caption, custom_prompt, account_name = get_next_scheduled_row(rows)
+        row_num, media_name, caption, custom_prompt, account_name, row_image_prompt = get_next_scheduled_row(rows)
         if not media_name:
             print(f"[{tab_name}] لا توجد منشورات جديدة في هذا التبويب.")
             return
 
         active_access_token = resolve_access_token(account_name, tab_name, page_id, default_access_token)
 
-        print(f"[{tab_name}] الصف {row_num}: البحث عن '{media_name}'...")
+        print(f"[{tab_name}] الصف {row_num}: البحث عن '{media_name}' في Drive...")
         media_file = find_media_in_drive(media_name)
         if not media_file:
             print(f"[{tab_name}] تحذير: الملف '{media_name}' غير موجود في مجلد Pending_Posts!")
@@ -394,13 +444,27 @@ def process_page(page_cfg):
 
         media_data = download_file(media_file['id'])
         is_video = is_video_file(media_file)
+        active_filename = media_file['name']
+        was_recreated = False
+
+        # إعادة صياغة الصورة فقط إذا وُجد برومت في العمود G
+        if not is_video and row_image_prompt:
+            print(f"[{tab_name}] إعادة صياغة الصورة عبر Google AI حسب برومت العمود G...")
+            media_data, active_filename = recreate_image_with_gemini(
+                media_data,
+                row_image_prompt,
+                aspect_ratio="4:5"
+            )
+            was_recreated = True
+        elif not is_video:
+            print(f"[{tab_name}] العمود G فارغ: سيتم نشر الصورة الأصلية كما هي.")
 
         if not caption:
             if is_video:
                 active_prompt = custom_prompt or DEFAULT_VIDEO_PROMPT
                 prompt_source = "العمود E" if custom_prompt else "عنوان Reel الافتراضي"
                 print(f"[{tab_name}] تحليل الفيديو وتوليد عنوان Reel بالإنجليزية (المصدر: {prompt_source})...")
-                caption = generate_caption_for_video(media_data, media_file['name'], active_prompt)
+                caption = generate_caption_for_video(media_data, active_filename, active_prompt)
             else:
                 active_prompt = custom_prompt or page_default_prompt or DEFAULT_PROMPT
                 prompt_source = "العمود E" if custom_prompt else ("إعدادات الصفحة" if page_default_prompt else "الافتراضي العام")
@@ -414,12 +478,15 @@ def process_page(page_cfg):
             fb_res = post_reel_to_facebook(page_id, active_access_token, media_data, caption)
             print(f"[{tab_name}] تم نشر الـ Reel بنجاح! معرف الفيديو: {fb_res.get('id')}")
         else:
-            fb_res = post_photo_to_facebook(page_id, active_access_token, media_data, media_file['name'], caption)
+            fb_res = post_photo_to_facebook(page_id, active_access_token, media_data, active_filename, caption)
             print(f"[{tab_name}] تم نشر الصورة بنجاح! رقم المنشور: {fb_res.get('id')}")
 
         move_to_archive(media_file['id'])
+        if was_recreated:
+            upload_image_to_archive(media_data, active_filename)
+
         update_sheet_row(tab_name, row_num, caption)
-        print(f"[{tab_name}] تم أرشفة الملف وحفظ العنوان/النص وتحديث الجدول.")
+        print(f"[{tab_name}] تم الأرشفة وحفظ النص وتحديث الجدول.")
 
     except Exception as e:
         print(f"[{tab_name}] حدث خطأ أثناء معالجة هذه الصفحة: {e}")
