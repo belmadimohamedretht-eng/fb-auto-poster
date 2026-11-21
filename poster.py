@@ -130,7 +130,14 @@ def recreate_image_with_gemini(source_image_stream, image_prompt, aspect_ratio="
                     )
                 )
 
-                for part in response.candidates[0].content.parts:
+                if not response.candidates:
+                    raise RuntimeError("لم يُرجع النموذج أي مرشحات (candidates) في الاستجابة.")
+
+                cand = response.candidates[0]
+                if not cand.content or not cand.content.parts:
+                    raise RuntimeError(f"لم تُرجع الصورة (السبب: {cand.finish_reason})")
+
+                for part in cand.content.parts:
                     if part.inline_data and part.inline_data.data:
                         out_stream = io.BytesIO(part.inline_data.data)
                         out_stream.seek(0)
@@ -163,8 +170,8 @@ def upload_image_to_archive(image_stream, filename):
     image_stream.seek(0)
 
 
-def find_media_in_drive(filename):
-    """البحث عن الصورة أو الفيديو في مجلد Pending_Posts"""
+def find_media_in_folder(filename, folder_id):
+    """البحث عن الصورة أو الفيديو في مجلد محدد"""
     base_name = os.path.splitext(filename.strip())[0]
     safe_base = base_name.replace("'", "\\'")
 
@@ -179,7 +186,7 @@ def find_media_in_drive(filename):
         f"name = '{safe_base}'"
     ]
     names_query = " or ".join(possible_names)
-    query = f"'{PENDING_FOLDER_ID}' in parents and ({names_query}) and trashed = false"
+    query = f"'{folder_id}' in parents and ({names_query}) and trashed = false"
 
     results = drive_service.files().list(
         q=query,
@@ -437,8 +444,14 @@ def process_page(page_cfg):
         active_access_token = resolve_access_token(account_name, tab_name, page_id, default_access_token)
 
         print(f"[{tab_name}] الصف {row_num}: البحث عن '{media_name}' في Drive...")
-        media_file = find_media_in_drive(media_name)
+        media_file = find_media_in_folder(media_name, PENDING_FOLDER_ID)
+
         if not media_file:
+            archived_file = find_media_in_folder(media_name, POSTED_FOLDER_ID)
+            if archived_file:
+                print(f"[{tab_name}] الملف '{media_name}' موجود مسبقاً في الأرشيف! جاري تحديث الشيت إلى Posted...")
+                update_sheet_row(tab_name, row_num, caption or "(تم النشر والأرشفة مسبقاً)")
+                return
             print(f"[{tab_name}] تحذير: الملف '{media_name}' غير موجود في مجلد Pending_Posts!")
             return
 
