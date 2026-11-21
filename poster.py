@@ -35,6 +35,21 @@ INTERVAL_MINUTES = 125
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
 
+# البرومت الافتراضي لإعادة صياغة الصور
+DEFAULT_IMAGE_RECREATE_PROMPT = (
+    "Transform the provided illustrated or non-realistic image into a hyper-realistic, ultra-detailed photograph "
+    "optimized for a Facebook feed post. Preserve the exact composition, main subjects, layout, and technical/automotive "
+    "details of the original image, replacing all drawn, cartoon, 3D render, or stylized elements with authentic "
+    "real-world textures—real metal, worn steel, rubber, realistic automotive paint, subtle oil/grease/dust marks where "
+    "natural, true-to-life reflections, and realistic shadows. Shoot with natural, balanced lighting, crisp focus, "
+    "shallow depth of field, and subtle DSLR camera texture for high scroll-stopping appeal on Facebook. Accurately "
+    "translate all visible text, labels, annotations, and signs from the original image into clear, natural English, "
+    "keeping them legible, properly aligned, and matching the surface perspective. Integrate a clean, bold, "
+    "high-contrast \"Cars Tools\" logo wherever fits most naturally and harmoniously in the composition, with clear "
+    "readability and without obstructing key subjects or text. Aspect ratio: 4:5. Photorealistic, high detail, sharp "
+    "text, no cartoon or illustration look."
+)
+
 # البرومت الافتراضي لنص المنشور للصور
 DEFAULT_PROMPT = (
     "اكتب منشورا كتابي على صفحة فايسبوك باللغة الانجليزية وباستعمال الإموجي حول محتوى الصورة.\n"
@@ -460,17 +475,17 @@ def process_page(page_cfg):
         active_filename = media_file['name']
         was_recreated = False
 
-        # إعادة صياغة الصورة فقط إذا وُجد برومت في العمود G
-        if not is_video and row_image_prompt:
-            print(f"[{tab_name}] إعادة صياغة الصورة عبر Google AI حسب برومت العمود G...")
+        # إعادة صياغة الصورة باستخدام برومت العمود G أو البرومت الافتراضي لإعادة الصياغة
+        if not is_video:
+            active_image_prompt = row_image_prompt or DEFAULT_IMAGE_RECREATE_PROMPT
+            img_prompt_source = "العمود G" if row_image_prompt else "البرومت الافتراضي لإعادة الصياغة"
+            print(f"[{tab_name}] إعادة صياغة الصورة عبر Google AI (المصدر: {img_prompt_source})...")
             media_data, active_filename = recreate_image_with_gemini(
                 media_data,
-                row_image_prompt,
+                active_image_prompt,
                 aspect_ratio="4:5"
             )
             was_recreated = True
-        elif not is_video:
-            print(f"[{tab_name}] العمود G فارغ: سيتم نشر الصورة الأصلية كما هي.")
 
         if not caption:
             if is_video:
